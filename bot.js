@@ -377,6 +377,16 @@ bot.on("document", adminOnly, async (ctx) => {
 bot.on("text", adminOnly, async (ctx) => {
   if (!ctx.message?.text) return;
   const text = ctx.message.text.trim();
+
+  // known bot.command() တွေကို bot.on("text") က intercept မလုပ်ရ
+  const knownCommands = [
+    "/start", "/accounts", "/addaccount", "/removeaccount", "/accountstatus",
+    "/msg", "/setinterval", "/setdelay", "/time", "/send", "/forcesend",
+    "/status", "/joingp", "/ratelimit"
+  ];
+  const cmdBase = text.split(" ")[0].split("@")[0];
+  if (knownCommands.includes(cmdBase)) return;
+
   const accounts = await getAccounts();
 
   for (const acc of accounts) {
