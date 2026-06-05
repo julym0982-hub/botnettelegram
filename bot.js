@@ -5,14 +5,11 @@ const { MongoClient } = require("mongodb");
 require("dotenv").config();
 
 // ─── CONFIG ───────────────────────────────────────────────────────────────────
-const BOT_TOKEN   = process.env.BOT_TOKEN;
-const API_ID      = parseInt(process.env.API_ID);
-const API_HASH    = process.env.API_HASH;
-const ADMIN_ID    = parseInt(process.env.ADMIN_ID);
-const MONGO_URI   = process.env.MONGO_URI;
-
-// တစ်ကောင်က တစ်ခုကို အနည်းဆုံး မိနစ်ဘယ်လောက်ကြာမှ ထပ်ပို့မလဲ
-const MIN_INTERVAL_MINUTES = 59;
+const BOT_TOKEN = process.env.BOT_TOKEN;
+const API_ID    = parseInt(process.env.API_ID);
+const API_HASH  = process.env.API_HASH;
+const ADMIN_ID  = parseInt(process.env.ADMIN_ID);
+const MONGO_URI = process.env.MONGO_URI;
 
 // ─── MONGODB ──────────────────────────────────────────────────────────────────
 let db;
@@ -23,55 +20,49 @@ async function connectDB() {
   console.log("✅ MongoDB connected!");
 }
 
-async function getSettings() {
+// Settings (global)
+async function getGlobalSettings() {
   return (await db.collection("settings").findOne({ _id: "main" })) || {};
 }
-
-async function saveSettings(data) {
-  await db.collection("settings").updateOne(
-    { _id: "main" },
-    { $set: data },
-    { upsert: true }
-  );
+async function saveGlobalSettings(data) {
+  await db.collection("settings").updateOne({ _id: "main" }, { $set: data }, { upsert: true });
 }
 
-async function getGPLinks() {
-  const doc = await db.collection("settings").findOne({ _id: "main" });
-  return doc?.gpLinks || [];
-}
-
-async function saveGPLinks(links) {
-  await saveSettings({ gpLinks: links });
-}
-
+// Accounts
 async function getAccounts() {
-  return await db.collection("accounts").find({}).toArray();
+  return await db.collection("accounts").find({}).sort({ order: 1, addedAt: 1 }).toArray();
 }
-
 async function getAccount(name) {
   return await db.collection("accounts").findOne({ name });
 }
-
-async function addAccount(name, sessionString) {
-  await db.collection("accounts").updateOne(
-    { name },
-    { $set: { name, sessionString, active: true, addedAt: new Date() } },
-    { upsert: true }
-  );
+async function saveAccount(name, data) {
+  await db.collection("accounts").updateOne({ name }, { $set: data }, { upsert: true });
 }
-
-async function removeAccount(name) {
+async function deleteAccount(name) {
   await db.collection("accounts").deleteOne({ name });
-  // clean up send logs for this account
   await db.collection("sendlogs").deleteMany({ accName: name });
 }
 
-// last sent time: { accName, gpLink } → timestamp
+// GP links per account
+async function getAccGPs(accName) {
+  const acc = await getAccount(accName);
+  return acc?.gpLinks || [];
+}
+async function saveAccGPs(accName, links) {
+  await saveAccount(accName, { gpLinks: links });
+}
+
+// Message per account (fallback to global)
+async function getAccMsg(accName, globalMsg) {
+  const acc = await getAccount(accName);
+  return acc?.customMsg || globalMsg || "";
+}
+
+// Send log (rate limit)
 async function getLastSent(accName, gpLink) {
   const doc = await db.collection("sendlogs").findOne({ accName, gpLink });
   return doc?.sentAt || null;
 }
-
 async function updateLastSent(accName, gpLink) {
   await db.collection("sendlogs").updateOne(
     { accName, gpLink },
@@ -81,67 +72,32 @@ async function updateLastSent(accName, gpLink) {
 }
 
 // ─── STATE ────────────────────────────────────────────────────────────────────
-let autoMessage     = "";
-let intervalMinutes = 0;
-let schedulerTimer  = null;
-let isSending       = false;
+let globalMsg        = "";
+let intervalMinutes  = 59;  // default 59 min
+let schedulerTimer   = null;
+let isSending        = false;
+let sendDelaySeconds = 6;   // delay between each GP send
 
-// TelegramClient pool: { name -> client }
-const clientPool = {};
-
-// pending account name waiting for session file
-const pendingAccountName = {};
+const clientPool = {};           // { accName -> TelegramClient }
+const pendingAdd = {};           // { adminId -> accName } waiting session file
 
 // ─── BOT ──────────────────────────────────────────────────────────────────────
 const bot = new Telegraf(BOT_TOKEN);
 
-// ─── HELPERS ──────────────────────────────────────────────────────────────────
-function isAdmin(ctx) {
-  return ctx.from && ctx.from.id === ADMIN_ID;
-}
+function isAdmin(ctx) { return ctx.from?.id === ADMIN_ID; }
 function adminOnly(ctx, next) {
   if (!isAdmin(ctx)) return ctx.reply("❌ Admin only.");
   return next();
 }
 
-// random delay between min~max seconds
-function randomDelay(minSec = 3, maxSec = 8) {
-  const ms = (Math.floor(Math.random() * (maxSec - minSec + 1)) + minSec) * 1000;
-  return new Promise((r) => setTimeout(r, ms));
-}
-
-// spin syntax: မင်္ဂလာပါ{spin}ဟေး{spin}ဟယ်လို → randomly pick one
-function spinMessage(template) {
-  return template.replace(/\{spin\}/g, () => "|").split("|").map(s => s.trim());
-}
-
 function pickSpun(template) {
   const parts = template.split("{spin}").map(s => s.trim());
-  if (parts.length === 1) return template;
-  // build variations: first word spins, rest stays
-  // Format: word1{spin}word2{spin}word3 rest of message
-  // We treat everything before first non-spin as the spinning part
-  // Simple approach: split by {spin}, pick random from array, rejoin if needed
-  // Actually: "ဟေး{spin}မင်္ဂလာ ညည်..." → ["ဟေး","မင်္ဂလာ ညည်..."]
-  // If 2 parts: spin[0] randomly chosen, rest is parts[1]
-  // If multiple {spin}: all segments random-picked as full message variants
-  const idx = Math.floor(Math.random() * parts.length);
-  return parts[idx];
-}
-
-// check if enough time passed since last send (per acc per gp)
-async function canSend(accName, gpLink) {
-  const lastSent = await getLastSent(accName, gpLink);
-  if (!lastSent) return true;
-  const diffMinutes = (Date.now() - new Date(lastSent).getTime()) / 60000;
-  return diffMinutes >= MIN_INTERVAL_MINUTES;
+  return parts[Math.floor(Math.random() * parts.length)];
 }
 
 async function buildClient(sessionString) {
   const client = new TelegramClient(
-    new StringSession(sessionString),
-    API_ID, API_HASH,
-    { connectionRetries: 5 }
+    new StringSession(sessionString), API_ID, API_HASH, { connectionRetries: 5 }
   );
   await client.connect();
   return client;
@@ -153,7 +109,7 @@ async function initAllClients() {
     if (!clientPool[acc.name]) {
       try {
         clientPool[acc.name] = await buildClient(acc.sessionString);
-        console.log(`✅ Account connected: ${acc.name}`);
+        console.log(`✅ Connected: ${acc.name}`);
       } catch (e) {
         console.error(`❌ Failed: ${acc.name} — ${e.message}`);
       }
@@ -161,546 +117,620 @@ async function initAllClients() {
   }
 }
 
+function sleep(sec) {
+  return new Promise(r => setTimeout(r, sec * 1000));
+}
+
 function startScheduler() {
   if (schedulerTimer) clearInterval(schedulerTimer);
   if (intervalMinutes <= 0) return;
   schedulerTimer = setInterval(async () => {
-    const gpLinks = await getGPLinks();
-    if (!autoMessage || gpLinks.length === 0) return;
-    await sendToAllGPs();
+    if (!isSending) await sendAllAccounts(false);
   }, intervalMinutes * 60 * 1000);
   console.log(`⏰ Scheduler: every ${intervalMinutes} min`);
 }
 
-// ─── CORE SEND FUNCTION ───────────────────────────────────────────────────────
-async function sendToAllGPs(forceSkipRateLimit = false) {
+// ─── CORE SEND ────────────────────────────────────────────────────────────────
+async function sendAllAccounts(force = false) {
   if (isSending) {
     await bot.telegram.sendMessage(ADMIN_ID, "⚠️ ပို့နေဆဲ ရှိသေးသည်၊ ခဏစောင့်ပါ။");
     return;
   }
 
-  const gpLinks  = await getGPLinks();
-  const accounts = Object.keys(clientPool);
+  const accounts = await getAccounts();
+  const activeAccs = accounts.filter(a => clientPool[a.name]);
 
-  if (!autoMessage) {
-    await bot.telegram.sendMessage(ADMIN_ID, "⚠️ Message မသတ်မှတ်ရသေး။ /msg ကိုသုံးပါ။");
-    return;
-  }
-  if (gpLinks.length === 0) {
-    await bot.telegram.sendMessage(ADMIN_ID, "⚠️ GP link မရှိသေး။ /gp ကိုသုံးပါ။");
-    return;
-  }
-  if (accounts.length === 0) {
-    await bot.telegram.sendMessage(ADMIN_ID, "⚠️ Account မရှိသေး။ /addaccount ကိုသုံးပါ။");
+  if (activeAccs.length === 0) {
+    await bot.telegram.sendMessage(ADMIN_ID, "⚠️ Connected account မရှိသေး။");
     return;
   }
 
   isSending = true;
-  let successCount = 0;
-  let failCount    = 0;
-  let skipCount    = 0;
+  let totalSuccess = 0, totalFail = 0, totalSkip = 0;
 
-  await bot.telegram.sendMessage(
-    ADMIN_ID,
-    `🚀 GP ${gpLinks.length} ခုဆီ ပို့မည်...\n` +
-    `👤 Account ${accounts.length} ခု ရှိသည်\n` +
-    `⏱ Random delay: 3~8 sec\n` +
-    `🔒 Rate limit: ${MIN_INTERVAL_MINUTES} မိနစ်/တစ်ကြိမ်`
+  await bot.telegram.sendMessage(ADMIN_ID,
+    `🚀 ပို့မည်...\n👤 Active accounts: ${activeAccs.length} ခု\n⏱ Delay: ${sendDelaySeconds}s`
   );
 
-  for (let i = 0; i < gpLinks.length; i++) {
-    const link    = gpLinks[i];
-    const num     = i + 1;
-    const accName = accounts[i % accounts.length];
-    const client  = clientPool[accName];
+  for (const acc of activeAccs) {
+    const client  = clientPool[acc.name];
+    const gpLinks = await getAccGPs(acc.name);
+    const msg     = await getAccMsg(acc.name, globalMsg);
 
-    // Rate limit check
-    if (!forceSkipRateLimit) {
-      const ok = await canSend(accName, link);
-      if (!ok) {
-        skipCount++;
-        const lastSent  = await getLastSent(accName, link);
-        const diffMin   = Math.floor((Date.now() - new Date(lastSent).getTime()) / 60000);
-        const remaining = MIN_INTERVAL_MINUTES - diffMin;
-        await bot.telegram.sendMessage(
-          ADMIN_ID,
-          `⏭ Skip ${num} — [${accName}]\n${link}\n⏰ ကျန်ချိန်: ${remaining} မိနစ်`
+    if (gpLinks.length === 0) {
+      await bot.telegram.sendMessage(ADMIN_ID,
+        `⏭ [${acc.name}] GP link မရှိသေး — skip`
+      );
+      continue;
+    }
+    if (!msg) {
+      await bot.telegram.sendMessage(ADMIN_ID,
+        `⏭ [${acc.name}] Message မသတ်မှတ်ရသေး — skip`
+      );
+      continue;
+    }
+
+    await bot.telegram.sendMessage(ADMIN_ID,
+      `\n▶️ [${acc.name}] GP ${gpLinks.length} ခုဆီ ပို့မည်...`
+    );
+
+    let accSuccess = 0, accFail = 0, accSkip = 0;
+
+    for (let i = 0; i < gpLinks.length; i++) {
+      const link = gpLinks[i];
+      const num  = i + 1;
+
+      // rate limit check
+      if (!force) {
+        const lastSent = await getLastSent(acc.name, link);
+        if (lastSent) {
+          const diffMin = (Date.now() - new Date(lastSent).getTime()) / 60000;
+          if (diffMin < intervalMinutes) {
+            const remaining = Math.ceil(intervalMinutes - diffMin);
+            accSkip++;
+            await bot.telegram.sendMessage(ADMIN_ID,
+              `⏭ Skip ${num} — [${acc.name}]\n⏳ ကျန်ချိန်: ${remaining} မိနစ်`
+            );
+            if (i < gpLinks.length - 1) await sleep(1);
+            continue;
+          }
+        }
+      }
+
+      const msgToSend = pickSpun(msg);
+
+      try {
+        const entity = await client.getEntity(link);
+        await client.sendMessage(entity, { message: msgToSend });
+        await updateLastSent(acc.name, link);
+        accSuccess++;
+        totalSuccess++;
+        await bot.telegram.sendMessage(ADMIN_ID,
+          `✅ Send ${num} done — [${acc.name}]`
         );
-        continue;
+      } catch (err) {
+        accFail++;
+        totalFail++;
+        await bot.telegram.sendMessage(ADMIN_ID,
+          `❌ Fail ${num} — [${acc.name}]\n⚠️ ${err.message}`
+        );
+      }
+
+      if (i < gpLinks.length - 1) {
+        await bot.telegram.sendMessage(ADMIN_ID, `⏳ ${sendDelaySeconds}s စောင့်နေသည်...`);
+        await sleep(sendDelaySeconds);
       }
     }
 
-    // Pick spun message variant
-    const msgToSend = pickSpun(autoMessage);
-
-    try {
-      const entity = await client.getEntity(link);
-      await client.sendMessage(entity, { message: msgToSend });
-      await updateLastSent(accName, link);
-      successCount++;
-      await bot.telegram.sendMessage(
-        ADMIN_ID,
-        `✅ Send ${num} done — [${accName}]\n${link}`
-      );
-    } catch (err) {
-      failCount++;
-      await bot.telegram.sendMessage(
-        ADMIN_ID,
-        `❌ Fail send ${num} — [${accName}]\n${link}\n⚠️ ${err.message}`
-      );
-    }
-
-    // Random delay before next send (skip delay on last item)
-    if (i < gpLinks.length - 1) {
-      const delaySec = Math.floor(Math.random() * 6) + 3; // 3~8
-      await bot.telegram.sendMessage(ADMIN_ID, `⏳ ${delaySec} sec စောင့်နေသည်...`);
-      await randomDelay(3, 8);
-    }
+    await bot.telegram.sendMessage(ADMIN_ID,
+      `📊 [${acc.name}] ပြီး — ✅${accSuccess} ❌${accFail} ⏭${accSkip}`
+    );
   }
 
-  await bot.telegram.sendMessage(
-    ADMIN_ID,
-    `📊 ပြီးဆုံးပါပြီ။\n\n` +
-    `✅ အောင်မြင်: ${successCount}\n` +
-    `❌ မအောင်မြင်: ${failCount}\n` +
-    `⏭ Skip (rate limit): ${skipCount}`
+  await bot.telegram.sendMessage(ADMIN_ID,
+    `\n🏁 အကုန်ပြီးပါပြီ\n✅ ${totalSuccess}  ❌ ${totalFail}  ⏭ ${totalSkip}`
   );
   isSending = false;
 }
 
-// ─── COMMANDS ─────────────────────────────────────────────────────────────────
-
+// ─── /start ───────────────────────────────────────────────────────────────────
 bot.start(adminOnly, async (ctx) => {
   const accounts = await getAccounts();
-  const gpLinks  = await getGPLinks();
-  const connected = accounts.filter((a) => clientPool[a.name]).length;
-  const sched = schedulerTimer && intervalMinutes > 0
-    ? `🟢 ${intervalMinutes} မိနစ်တစ်ကြိမ်`
-    : "🔴 မဖွင့်ရသေး";
+  const connected = accounts.filter(a => clientPool[a.name]).length;
+  const sched = schedulerTimer ? `🟢 ${intervalMinutes} မိနစ်တစ်ကြိမ်` : "🔴 ပိတ်";
 
   ctx.reply(
-`👋 ကြိုဆိုပါတယ်! GP Auto Sender Bot 🤖
+`👋 GP Auto Sender Bot 🤖
 
-📊 လောလောဆယ် အခြေအနေ:
-👤 Accounts: ${accounts.length} ခု (🟢 ${connected} connected)
-🔗 GP Links: ${gpLinks.length} ခု
-💬 Message: ${autoMessage ? `"${autoMessage.substring(0,30)}..."` : "⚠️ မသတ်မှတ်ရသေး"}
+📊 အခြေအနေ:
+👤 Accounts: ${accounts.length} (🟢${connected} connected)
+💬 Global msg: ${globalMsg ? `"${globalMsg.substring(0,25)}..."` : "⚠️ မသတ်မှတ်ရသေး"}
 ⏰ Scheduler: ${sched}
+⏱ Delay: ${sendDelaySeconds}s | 🔒 Interval: ${intervalMinutes} မိနစ်
 
 ━━━━━━━━━━━━━━━━━━
-👤 ACCOUNT Commands
+👤 ACCOUNT
 ━━━━━━━━━━━━━━━━━━
-/accounts
-  → ထည့်ထားတဲ့ account တွေစာရင်းကြည့်
-
-/addaccount acc1
-  → "acc1" ဆိုတဲ့နာမည်နဲ့ account ထည့်
-  → Bot က session file တောင်းမည်
-  → .txt file ပို့ရုံပဲ ✅
-
-/removeaccount acc1
-  → "acc1" account ဖျက်
-
-/accountstatus
-  → တစ်ကောင်ချင်း connected/disconnected ကြည့်
+/accounts — စာရင်းကြည့်
+/addaccount acc1 — account ထည့် (session file ပို့ရမည်)
+/removeaccount acc1 — ဖျက်
+/accountstatus — connected status
 
 ━━━━━━━━━━━━━━━━━━
-🔗 GP LINK Commands
+🔗 GP (per account)
 ━━━━━━━━━━━━━━━━━━
-/gp
-  → ရှိပြီးသား GP link တွေကြည့်
-
-/gp https://t.me/+xxx,https://t.me/+yyy
-  → GP link တွေ comma ခြားပြီး တစ်ခါတည်းထည့်
-
-/addgp https://t.me/+xxx
-  → GP link တစ်ခုချင်းထပ်ထည့်
-
-/removegp 2
-  → နံပါတ် 2 GP link ဖျက်
-
-/cleargp
-  → GP link အကုန်ဖျက်
-
-/editgp
-  → edit menu ဖွင့်ကြည့်
+/checkaccount1 — acc1 ရဲ့ GP, msg, ကျန်ချိန် ကြည့်
+/acc1gp link1,link2 — acc1 ရဲ့ GP သတ်မှတ်
+/acc1addgp link — acc1 ကို GP တစ်ခုထည့်
+/acc1removegp 2 — acc1 ရဲ့ နံပါတ် 2 GP ဖျက်
+/acc1cleargp — acc1 ရဲ့ GP အကုန်ဖျက်
 
 ━━━━━━━━━━━━━━━━━━
-💬 MESSAGE Commands
+💬 MESSAGE
 ━━━━━━━━━━━━━━━━━━
-/msg မင်္ဂလာပါ ညီကိုများ ဖိတ်ပါတယ်
-  → ပို့မည့် message သတ်မှတ်
-
-/msg မင်္ဂလာပါ{spin}ဟေး{spin}ဟယ်လို ညီကိုများ
-  → {spin} ထည့်ရင် ပို့တိုင်း randomly ပြောင်းမည်
-  → GP1: "မင်္ဂလာပါ ညီကိုများ"
-  → GP2: "ဟေး ညီကိုများ"
-  → GP3: "ဟယ်လို ညီကိုများ"
-  → Spam filter မကျအောင် ✅
+/msg စာသား — global msg (account အကုန်သုံး)
+/acc1msg စာသား — acc1 သီးသန့် msg
+  💡 Spin: မင်္ဂလာပါ{spin}ဟေး{spin}ဟယ်လို ညည်...
 
 ━━━━━━━━━━━━━━━━━━
-⏰ SCHEDULER Commands
+⚙️ SETTINGS
 ━━━━━━━━━━━━━━━━━━
-/time 10min
-  → 10 မိနစ်တိုင်း တစ်ကြိမ် auto ပို့
-  → 24 နာရီ ပတ်လုံး အလိုအလျောက် ✅
-
-/time stop
-  → auto ပို့ ရပ်
-
-/send
-  → ချက်ချင်း တစ်ကြိမ်ပို့ (rate limit စစ်မည်)
-
-/forcesend
-  → rate limit မစစ်ဘဲ ချက်ချင်းအကုန်ပို့
-
-/status
-  → လောလောဆယ် settings + ကျန်ချိန် အကုန်ကြည့်
-
-/ratelimit
-  → GP တစ်ခုချင်း ဘယ်မိနစ်မှ ထပ်ပို့လို့ရမည် ကြည့်
+/setinterval 59min — rate limit ပြောင်း (e.g. 2hr, 30min)
+/setdelay 6 — GP တိုင်းကြား delay seconds ပြောင်း
 
 ━━━━━━━━━━━━━━━━━━
-🛡 Spam Protection (auto)
+📤 SEND
 ━━━━━━━━━━━━━━━━━━
-✅ Random delay: GP တိုင်းကြား 3~8 sec
-✅ Rate limit: တစ်ကောင်က တစ်ခုကို ${MIN_INTERVAL_MINUTES} မိနစ်တစ်ကြိမ်
-✅ Message spin: ပို့တိုင်း message ပြောင်း
-✅ Round-robin: account တွေ rotate လုပ်ပို့
+/send — rate limit စစ်ပြီးပို့
+/forcesend — rate limit မစစ်ဘဲ အကုန်ပို့
+/time 60min — scheduler ဖွင့်
+/time stop — scheduler ရပ်
+/status — လောလောဆယ် status အကုန်
 
 ━━━━━━━━━━━━━━━━━━
-📌 စတင်သုံးနည်း (အဆင့်)
+🤝 GP JOIN
 ━━━━━━━━━━━━━━━━━━
-1️⃣ /addaccount acc1 → session file ပို့
-2️⃣ /gp link1,link2,... → GP ထည့်
-3️⃣ /msg စာသား → message သတ်မှတ်
-4️⃣ /time 10min → auto ပို့ဖွင့်`
+/joingp link1,link2,... — account အကုန် join
+/joingp acc1 link1,link2 — acc1 တစ်ကောင်တည်း join
+  (join တိုင်းကြား 3s delay ပါမည်)
+
+━━━━━━━━━━━━━━━━━━
+📌 စတင်သုံးနည်း
+━━━━━━━━━━━━━━━━━━
+1️⃣ /addaccount acc1 → file ပို့
+2️⃣ /joingp link1,link2 → GP join
+3️⃣ /acc1gp link1,link2 → GP send list ထည့်
+4️⃣ /msg မင်္ဂလာပါ (သို့) /acc1msg ...
+5️⃣ /time 60min → scheduler ဖွင့်`
   );
 });
 
 // ─── ACCOUNT COMMANDS ─────────────────────────────────────────────────────────
-
 bot.command("accounts", adminOnly, async (ctx) => {
   const accounts = await getAccounts();
-  if (accounts.length === 0) return ctx.reply("📭 Account မရှိသေး။\n\nထည့်ရန်: /addaccount (နာမည်)");
+  if (accounts.length === 0) return ctx.reply("📭 Account မရှိသေး။\n/addaccount acc1");
   const list = accounts.map((a, i) => {
-    const status = clientPool[a.name] ? "🟢" : "🔴";
-    return `${i + 1}. ${status} ${a.name}`;
+    const st = clientPool[a.name] ? "🟢" : "🔴";
+    const gps = (a.gpLinks || []).length;
+    const hasMsg = a.customMsg ? "💬" : "";
+    return `${i+1}. ${st} ${a.name} — GP:${gps} ${hasMsg}`;
   }).join("\n");
-  ctx.reply(`👤 Accounts (${accounts.length} ခု):\n\n${list}\n\n🟢=connected 🔴=disconnected`);
+  ctx.reply(`👤 Accounts (${accounts.length}):\n\n${list}\n\n🟢=on 🔴=off 💬=custom msg`);
 });
 
 bot.command("addaccount", adminOnly, async (ctx) => {
   const name = ctx.message.text.split(" ").slice(1).join(" ").trim();
-  if (!name) return ctx.reply("⚠️ Usage: /addaccount (နာမည်)\nဥပမာ: /addaccount acc1");
-  pendingAccountName[ADMIN_ID] = name;
-  ctx.reply(
-    `📎 "${name}" အတွက် session file ပို့ပါ\n\n` +
-    `get-session.js run ပြီးရတဲ့ string ကို\n` +
-    `.txt file အဖြစ် save လုပ်ပြီး ဒီ chat မှာ ပို့ပါ`
-  );
+  if (!name) return ctx.reply("⚠️ Usage: /addaccount acc1");
+  pendingAdd[ADMIN_ID] = name;
+  ctx.reply(`📎 "${name}" အတွက် session .txt file ပို့ပါ`);
 });
 
 bot.command("removeaccount", adminOnly, async (ctx) => {
   const name = ctx.message.text.split(" ").slice(1).join(" ").trim();
-  if (!name) return ctx.reply("⚠️ Usage: /removeaccount (နာမည်)");
-  const acc = await getAccount(name);
-  if (!acc) return ctx.reply(`❌ "${name}" မတွေ့ပါ။`);
-  if (clientPool[name]) {
-    try { await clientPool[name].disconnect(); } catch (_) {}
-    delete clientPool[name];
-  }
-  await removeAccount(name);
+  if (!name) return ctx.reply("⚠️ Usage: /removeaccount acc1");
+  if (!(await getAccount(name))) return ctx.reply(`❌ "${name}" မတွေ့ပါ။`);
+  if (clientPool[name]) { try { await clientPool[name].disconnect(); } catch(_){} delete clientPool[name]; }
+  await deleteAccount(name);
   ctx.reply(`🗑️ "${name}" ဖျက်ပြီးပါပြီ။`);
 });
 
 bot.command("accountstatus", adminOnly, async (ctx) => {
   const accounts = await getAccounts();
   if (accounts.length === 0) return ctx.reply("📭 Account မရှိသေး။");
-  const lines = accounts.map((a, i) => {
-    const status = clientPool[a.name] ? "🟢 Connected" : "🔴 Disconnected";
-    return `${i + 1}. ${a.name} — ${status}`;
-  });
+  const lines = accounts.map((a, i) =>
+    `${i+1}. ${a.name} — ${clientPool[a.name] ? "🟢 Connected" : "🔴 Disconnected"}`
+  );
   ctx.reply(`📊 Account Status:\n\n${lines.join("\n")}`);
 });
 
-// ─── SESSION FILE HANDLER ─────────────────────────────────────────────────────
-
+// session file upload
 bot.on("document", adminOnly, async (ctx) => {
-  const name = pendingAccountName[ADMIN_ID];
-  if (!name) return ctx.reply("⚠️ /addaccount (နာမည်) ကို အရင်ရိုက်ပါ။");
-
+  const name = pendingAdd[ADMIN_ID];
+  if (!name) return ctx.reply("⚠️ /addaccount acc1 ကို အရင်ရိုက်ပါ။");
   try {
-    const fileId   = ctx.message.document.file_id;
-    const fileInfo = await ctx.telegram.getFile(fileId);
-    const fileUrl  = `https://api.telegram.org/file/bot${BOT_TOKEN}/${fileInfo.file_path}`;
-
+    const info = await ctx.telegram.getFile(ctx.message.document.file_id);
+    const url  = `https://api.telegram.org/file/bot${BOT_TOKEN}/${info.file_path}`;
     const https = require("https");
-    const sessionString = await new Promise((resolve, reject) => {
-      https.get(fileUrl, (res) => {
-        let data = "";
-        res.on("data", (c) => (data += c));
-        res.on("end", () => resolve(data.trim()));
-        res.on("error", reject);
+    const sessionStr = await new Promise((res, rej) => {
+      https.get(url, r => {
+        let d = ""; r.on("data", c => d += c); r.on("end", () => res(d.trim())); r.on("error", rej);
       });
     });
+    if (!sessionStr || sessionStr.length < 20) return ctx.reply("❌ File မှားနေသည်။");
+    await ctx.reply(`⏳ "${name}" ချိတ်နေသည်...`);
+    const client = await buildClient(sessionStr);
+    clientPool[name] = client;
+    const accounts = await getAccounts();
+    await saveAccount(name, {
+      name, sessionString: sessionStr, active: true,
+      gpLinks: [], customMsg: "", order: accounts.length, addedAt: new Date()
+    });
+    delete pendingAdd[ADMIN_ID];
+    ctx.reply(`✅ "${name}" connected! 🎉\n\n/acc${name.replace(/\D/g,'')}gp link1,link2 နဲ့ GP ထည့်ပါ`);
+  } catch(err) {
+    ctx.reply(`❌ Error: ${err.message}`);
+  }
+});
 
-    if (!sessionString || sessionString.length < 20) {
-      return ctx.reply("❌ Session file မှားနေသည်။ ထပ်ကြိုးစားပါ။");
+// ─── DYNAMIC ACCOUNT COMMANDS ─────────────────────────────────────────────────
+// /checkaccountN, /accNgp, /accNaddgp, /accNremovegp, /accNcleargp, /accNmsg
+bot.on("text", adminOnly, async (ctx) => {
+  if (!ctx.message?.text) return;
+  const text = ctx.message.text.trim();
+  const accounts = await getAccounts();
+
+  for (const acc of accounts) {
+    const n = acc.name;
+
+    // /checkaccountN or /check_accname
+    if (text === `/check${n}` || text === `/checkaccount_${n}`) {
+      const gpLinks = await getAccGPs(n);
+      const msg     = await getAccMsg(n, globalMsg);
+      const st      = clientPool[n] ? "🟢 Connected" : "🔴 Disconnected";
+      let gpStatus  = "";
+
+      if (gpLinks.length === 0) {
+        gpStatus = "\n📭 GP link မရှိသေး";
+      } else {
+        gpStatus = `\n\n━━━━━━━━━━━━━━━━━━\n📋 GP List & ကျန်ချိန်\n━━━━━━━━━━━━━━━━━━`;
+        for (let i = 0; i < gpLinks.length; i++) {
+          const link = gpLinks[i];
+          const lastSent = await getLastSent(n, link);
+          const shortLink = link.length > 35 ? link.substring(0,35)+"..." : link;
+          if (!lastSent) {
+            gpStatus += `\n${i+1}. ✅ အသင့်ဖြစ်ပြီ\n   ${shortLink}`;
+          } else {
+            const diffMin   = (Date.now() - new Date(lastSent).getTime()) / 60000;
+            const remaining = Math.ceil(intervalMinutes - diffMin);
+            gpStatus += remaining <= 0
+              ? `\n${i+1}. ✅ အသင့်ဖြစ်ပြီ\n   ${shortLink}`
+              : `\n${i+1}. ⏳ ${remaining} မိနစ်ကျန်\n   ${shortLink}`;
+          }
+        }
+      }
+
+      return ctx.reply(
+        `👤 [${n}] Status\n\n` +
+        `📶 ${st}\n` +
+        `🔗 GP: ${gpLinks.length} ခု\n` +
+        `💬 Message: ${acc.customMsg ? `"${acc.customMsg.substring(0,40)}..." (custom)` : msg ? `"${msg.substring(0,40)}..." (global)` : "⚠️ မသတ်မှတ်ရသေး"}` +
+        gpStatus +
+        `\n\n📝 Edit:\n/acc${n}gp link1,link2\n/acc${n}addgp link\n/acc${n}removegp 1\n/acc${n}msg စာသား`
+      );
     }
 
-    await ctx.reply(`⏳ "${name}" account ချိတ်နေသည်...`);
-    const client = await buildClient(sessionString);
-    clientPool[name] = client;
-    await addAccount(name, sessionString);
-    delete pendingAccountName[ADMIN_ID];
+    // /accNgp link1,link2 — set GP list
+    if (text.startsWith(`/acc${n}gp `)) {
+      const args = text.slice(`/acc${n}gp `.length).trim();
+      const links = args.split(",").map(l => l.trim()).filter(Boolean);
+      if (links.length === 0) return ctx.reply("⚠️ link ထည့်ပါ");
+      await saveAccGPs(n, links);
+      const list = links.map((l,i) => `${i+1}. ${l}`).join("\n");
+      return ctx.reply(`✅ [${n}] GP ${links.length} ခု သတ်မှတ်ပြီး:\n\n${list}`);
+    }
 
-    ctx.reply(`✅ "${name}" connected ဖြစ်ပါပြီ! 🎉\n\n/accounts နိပ်ပြီးကြည့်နိုင်သည်။`);
-  } catch (err) {
-    ctx.reply(`❌ Error: ${err.message}\n\nSession string မှားနိုင်သည်။`);
+    // /accNgp alone — view
+    if (text === `/acc${n}gp`) {
+      const links = await getAccGPs(n);
+      if (links.length === 0) return ctx.reply(`📭 [${n}] GP link မရှိသေး\n/acc${n}gp link1,link2`);
+      const list = links.map((l,i) => `${i+1}. ${l}`).join("\n");
+      return ctx.reply(`📋 [${n}] GP (${links.length}):\n\n${list}`);
+    }
+
+    // /accNaddgp link
+    if (text.startsWith(`/acc${n}addgp `)) {
+      const link = text.slice(`/acc${n}addgp `.length).trim();
+      if (!link) return ctx.reply("⚠️ link ထည့်ပါ");
+      const links = await getAccGPs(n);
+      links.push(link);
+      await saveAccGPs(n, links);
+      return ctx.reply(`✅ [${n}] GP ထည့်ပြီး:\n${link}\n\nစုစုပေါင်း: ${links.length} ခု`);
+    }
+
+    // /accNremovegp 2
+    if (text.startsWith(`/acc${n}removegp `)) {
+      const arg = text.split(" ")[1];
+      const links = await getAccGPs(n);
+      const idx = parseInt(arg) - 1;
+      if (isNaN(idx) || idx < 0 || idx >= links.length)
+        return ctx.reply(`⚠️ 1 မှ ${links.length} ထိ နံပါတ်ထည့်ပါ`);
+      const removed = links.splice(idx, 1)[0];
+      await saveAccGPs(n, links);
+      return ctx.reply(`🗑️ [${n}] ဖျက်ပြီး:\n${removed}\n\nကျန်: ${links.length} ခု`);
+    }
+
+    // /accNcleargp
+    if (text === `/acc${n}cleargp`) {
+      await saveAccGPs(n, []);
+      return ctx.reply(`🗑️ [${n}] GP အကုန်ဖျက်ပြီး။`);
+    }
+
+    // /accNmsg text
+    if (text.startsWith(`/acc${n}msg `)) {
+      const msg = text.slice(`/acc${n}msg `.length).trim();
+      await saveAccount(n, { customMsg: msg });
+      const parts = msg.split("{spin}");
+      return ctx.reply(
+        `✅ [${n}] Custom message:\n\n"${msg}"` +
+        (parts.length > 1 ? `\n\n💡 Spin ${parts.length} မျိုး` : "")
+      );
+    }
+
+    // /accNmsg alone — view or clear
+    if (text === `/acc${n}msg`) {
+      const a = await getAccount(n);
+      return ctx.reply(
+        a?.customMsg
+          ? `💬 [${n}] Custom msg:\n\n"${a.customMsg}"\n\nဖျက်ရန်: /acc${n}clearmsg`
+          : `💬 [${n}] Custom msg မသတ်မှတ်ရသေး (global msg သုံးနေသည်)\n\nသတ်မှတ်ရန်: /acc${n}msg စာသား`
+      );
+    }
+
+    // /accNclearmsg
+    if (text === `/acc${n}clearmsg`) {
+      await saveAccount(n, { customMsg: "" });
+      return ctx.reply(`🗑️ [${n}] Custom msg ဖျက်ပြီး (global msg ကိုပြန်သုံးမည်)`);
+    }
   }
 });
 
-// ─── GP COMMANDS ──────────────────────────────────────────────────────────────
-
-bot.command("gp", adminOnly, async (ctx) => {
-  const args = ctx.message.text.split(" ").slice(1).join(" ").trim();
-  const gpLinks = await getGPLinks();
-  if (!args) {
-    if (gpLinks.length === 0) return ctx.reply("📭 GP link မရှိသေး။\n\nထည့်ရန်: /gp link1,link2,...");
-    const list = gpLinks.map((l, i) => `${i + 1}. ${l}`).join("\n");
-    return ctx.reply(`📋 GP Links (${gpLinks.length} ခု):\n\n${list}`);
-  }
-  const newLinks = args.split(",").map((l) => l.trim()).filter(Boolean);
-  await saveGPLinks(newLinks);
-  const list = newLinks.map((l, i) => `${i + 1}. ${l}`).join("\n");
-  ctx.reply(`✅ GP ${newLinks.length} ခု သတ်မှတ်ပြီးပါပြီ။\n\n${list}`);
-});
-
-bot.command("addgp", adminOnly, async (ctx) => {
-  const link = ctx.message.text.split(" ").slice(1).join(" ").trim();
-  if (!link) return ctx.reply("⚠️ Usage: /addgp (link)");
-  const gpLinks = await getGPLinks();
-  gpLinks.push(link);
-  await saveGPLinks(gpLinks);
-  ctx.reply(`✅ ထည့်ပြီးပါပြီ။\n${link}\n\nစုစုပေါင်း GP: ${gpLinks.length} ခု`);
-});
-
-bot.command("removegp", adminOnly, async (ctx) => {
-  const arg = ctx.message.text.split(" ")[1];
-  const gpLinks = await getGPLinks();
-  const idx = parseInt(arg) - 1;
-  if (isNaN(idx) || idx < 0 || idx >= gpLinks.length) {
-    return ctx.reply(`⚠️ Usage: /removegp (နံပါတ်)\n1 မှ ${gpLinks.length} အတွင်း`);
-  }
-  const removed = gpLinks.splice(idx, 1)[0];
-  await saveGPLinks(gpLinks);
-  ctx.reply(`🗑️ ဖျက်ပြီး:\n${removed}\n\nကျန် GP: ${gpLinks.length} ခု`);
-});
-
-bot.command("cleargp", adminOnly, async (ctx) => {
-  await saveGPLinks([]);
-  ctx.reply("🗑️ GP link အကုန် ဖျက်ပြီးပါပြီ။");
-});
-
-bot.command("editgp", adminOnly, async (ctx) => {
-  const gpLinks = await getGPLinks();
-  if (gpLinks.length === 0) return ctx.reply("📭 GP link မရှိသေး။");
-  const list = gpLinks.map((l, i) => `${i + 1}. ${l}`).join("\n");
-  ctx.reply(
-    `📋 GP Links (${gpLinks.length} ခု):\n\n${list}\n\n` +
-    `/addgp (link) — ထည့်ရန်\n` +
-    `/removegp (နံပါတ်) — ဖျက်ရန်\n` +
-    `/cleargp — အကုန်ဖျက်ရန်`
-  );
-});
-
-// ─── MSG ──────────────────────────────────────────────────────────────────────
-
+// ─── GLOBAL MSG ───────────────────────────────────────────────────────────────
 bot.command("msg", adminOnly, (ctx) => {
   const text = ctx.message.text.split(" ").slice(1).join(" ").trim();
   if (!text) {
     return ctx.reply(
-      autoMessage
-        ? `📝 လောလောဆယ် message:\n\n${autoMessage}\n\n` +
-          `💡 Spin syntax: word1{spin}word2{spin}word3 rest\n` +
-          `ပြောင်းရန်: /msg (message)`
-        : `⚠️ Usage: /msg (message)\n\n` +
-          `💡 Spin syntax ဥပမာ:\n` +
-          `/msg မင်္ဂလာပါ{spin}ဟေး{spin}ဟယ်လို ညီကိုများ ကျွန်တော်တို့ group ကိုဖိတ်ပါတယ်`
+      globalMsg
+        ? `💬 Global message:\n\n"${globalMsg}"\n\nပြောင်းရန်: /msg စာသား`
+        : "⚠️ Usage: /msg စာသား\n\n💡 Spin: မင်္ဂလာပါ{spin}ဟေး{spin}ဟယ်လို ..."
     );
   }
-  autoMessage = text;
-
-  // preview spin variants
+  globalMsg = text;
+  saveGlobalSettings({ globalMsg }).catch(() => {});
   const parts = text.split("{spin}");
-  let preview = `✅ Message သတ်မှတ်ပြီးပါပြီ:\n\n"${text}"`;
-  if (parts.length > 1) {
-    preview += `\n\n💡 Spin variants (${parts.length} မျိုး):\n`;
-    parts.forEach((p, i) => { preview += `${i + 1}. "${p.trim()}..."\n`; });
-  }
-  ctx.reply(preview);
-});
-
-// ─── TIME / SEND / STATUS / RATELIMIT ─────────────────────────────────────────
-
-bot.command("time", adminOnly, (ctx) => {
-  const arg = ctx.message.text.split(" ")[1];
-  if (!arg) {
-    return ctx.reply(
-      intervalMinutes > 0
-        ? `⏰ Interval: ${intervalMinutes} မိနစ်တစ်ကြိမ် 🟢\n\nရပ်ရန်: /time stop`
-        : "⚠️ Usage: /time (N)min\nဥပမာ: /time 10min"
-    );
-  }
-  if (arg.toLowerCase() === "stop") {
-    if (schedulerTimer) { clearInterval(schedulerTimer); schedulerTimer = null; }
-    intervalMinutes = 0;
-    saveSettings({ intervalMinutes: 0 }).catch(() => {});
-    return ctx.reply("⏹️ Auto ပို့ ရပ်ပြီးပါပြီ။");
-  }
-  const match = arg.match(/^(\d+)min$/i);
-  if (!match) return ctx.reply("⚠️ Format မှားသည်။ ဥပမာ: /time 10min");
-  intervalMinutes = parseInt(match[1]);
-  if (intervalMinutes < 1) return ctx.reply("⚠️ အနည်းဆုံး 1 မိနစ်");
-  startScheduler();
-  saveSettings({ intervalMinutes }).catch(() => {});
   ctx.reply(
-    `✅ ${intervalMinutes} မိနစ်တိုင်း တစ်ကြိမ် auto ပို့မည် 🟢\n` +
-    `🔒 Rate limit: တစ်ကောင်က တစ်ခုကို ${MIN_INTERVAL_MINUTES} မိနစ်တစ်ကြိမ်သာ\n\n` +
-    `ရပ်ရန်: /time stop`
+    `✅ Global message:\n\n"${text}"` +
+    (parts.length > 1 ? `\n\n💡 Spin ${parts.length} မျိုး:\n` + parts.map((p,i) => `${i+1}. "${p.trim()}"`).join("\n") : "")
   );
 });
 
+// ─── SETTINGS ─────────────────────────────────────────────────────────────────
+bot.command("setinterval", adminOnly, (ctx) => {
+  const arg = ctx.message.text.split(" ")[1];
+  if (!arg) return ctx.reply(`⚠️ Usage: /setinterval 59min (သို့) /setinterval 2hr\nလက်ရှိ: ${intervalMinutes} မိနစ်`);
+
+  let mins = 0;
+  const hrMatch  = arg.match(/^(\d+)hr$/i);
+  const minMatch = arg.match(/^(\d+)min$/i);
+  if (hrMatch)  mins = parseInt(hrMatch[1]) * 60;
+  else if (minMatch) mins = parseInt(minMatch[1]);
+  else return ctx.reply("⚠️ Format: 59min (သို့) 2hr");
+
+  if (mins < 1) return ctx.reply("⚠️ အနည်းဆုံး 1 မိနစ်");
+  intervalMinutes = mins;
+  saveGlobalSettings({ intervalMinutes }).catch(() => {});
+  if (schedulerTimer) startScheduler(); // restart with new interval
+  ctx.reply(`✅ Rate limit & scheduler interval: ${mins} မိနစ် (${mins >= 60 ? (mins/60).toFixed(1)+"hr" : mins+"min"})`);
+});
+
+bot.command("setdelay", adminOnly, (ctx) => {
+  const arg = parseInt(ctx.message.text.split(" ")[1]);
+  if (isNaN(arg) || arg < 1) return ctx.reply("⚠️ Usage: /setdelay 6\n(seconds, အနည်းဆုံး 1)");
+  sendDelaySeconds = arg;
+  saveGlobalSettings({ sendDelaySeconds }).catch(() => {});
+  ctx.reply(`✅ GP တိုင်းကြား delay: ${sendDelaySeconds} seconds`);
+});
+
+// ─── TIME / SEND ──────────────────────────────────────────────────────────────
+bot.command("time", adminOnly, (ctx) => {
+  const arg = ctx.message.text.split(" ")[1];
+  if (!arg) return ctx.reply(
+    schedulerTimer
+      ? `⏰ Scheduler: ${intervalMinutes} မိနစ်တစ်ကြိမ် 🟢\n\nရပ်ရန်: /time stop`
+      : "⚠️ Usage: /time 60min\nရပ်ရန်: /time stop"
+  );
+  if (arg.toLowerCase() === "stop") {
+    if (schedulerTimer) { clearInterval(schedulerTimer); schedulerTimer = null; }
+    return ctx.reply("⏹️ Scheduler ရပ်ပြီး။");
+  }
+  const hrM  = arg.match(/^(\d+)hr$/i);
+  const minM = arg.match(/^(\d+)min$/i);
+  let mins = 0;
+  if (hrM)      mins = parseInt(hrM[1]) * 60;
+  else if (minM) mins = parseInt(minM[1]);
+  else return ctx.reply("⚠️ Format: /time 60min (သို့) /time 2hr");
+  if (mins < 1) return ctx.reply("⚠️ အနည်းဆုံး 1 မိနစ်");
+  intervalMinutes = mins;
+  saveGlobalSettings({ intervalMinutes }).catch(() => {});
+  startScheduler();
+  ctx.reply(`✅ Scheduler: ${mins} မိနစ်တစ်ကြိမ် 🟢\n🔒 Rate limit: ${mins} မိနစ်\n\nရပ်ရန်: /time stop`);
+});
+
 bot.command("send", adminOnly, async (ctx) => {
-  await ctx.reply("📤 GP တွေဆီ စတင်ပို့မည်... (rate limit စစ်မည်)");
-  await sendToAllGPs(false);
+  await ctx.reply("📤 ပို့မည်... (rate limit စစ်မည်)");
+  await sendAllAccounts(false);
 });
 
 bot.command("forcesend", adminOnly, async (ctx) => {
   await ctx.reply("⚡ Force send — rate limit မစစ်ဘဲ အကုန်ပို့မည်!");
-  await sendToAllGPs(true);
+  await sendAllAccounts(true);
 });
 
+// ─── STATUS ───────────────────────────────────────────────────────────────────
 bot.command("status", adminOnly, async (ctx) => {
-  const gpLinks  = await getGPLinks();
   const accounts = await getAccounts();
-  const connected = accounts.filter((a) => clientPool[a.name]).length;
-  const accNames  = Object.keys(clientPool);
+  const connected = accounts.filter(a => clientPool[a.name]).length;
+  const sched = schedulerTimer ? `🟢 ${intervalMinutes} မိနစ်တစ်ကြိမ်` : "🔴 ပိတ်";
 
-  const sched = schedulerTimer && intervalMinutes > 0
-    ? `🟢 ${intervalMinutes} မိနစ်တစ်ကြိမ်`
-    : "🔴 ပိတ်ထား";
+  let lines = `📊 Status\n\n`;
+  lines += `👤 Accounts: ${accounts.length} (🟢${connected})\n`;
+  lines += `💬 Global msg: ${globalMsg ? `"${globalMsg.substring(0,30)}..."` : "⚠️ မသတ်မှတ်ရသေး"}\n`;
+  lines += `⏰ Scheduler: ${sched}\n`;
+  lines += `🔒 Interval: ${intervalMinutes} မိနစ်\n`;
+  lines += `⏱ Delay: ${sendDelaySeconds}s\n`;
+  lines += `🔄 ပို့နေဆဲ: ${isSending ? "🔄 ဟုတ်" : "❌ မဟုတ်"}`;
 
-  const parts = autoMessage.split("{spin}");
-  const msgInfo = autoMessage
-    ? `"${autoMessage.substring(0, 35)}..." (${parts.length} spin)`
-    : "⚠️ မသတ်မှတ်ရသေး";
+  for (const acc of accounts) {
+    const gpLinks = await getAccGPs(acc.name);
+    const st      = clientPool[acc.name] ? "🟢" : "🔴";
+    const msg     = acc.customMsg ? `custom` : `global`;
+    lines += `\n\n━━━━━━━━━━━━━━━━━━\n${st} [${acc.name}] — GP:${gpLinks.length} msg:${msg}`;
 
-  // GP rate limit remaining per link
-  let gpStatus = "";
-  if (gpLinks.length > 0 && accNames.length > 0) {
-    gpStatus += "\n\n━━━━━━━━━━━━━━━━━━\n📋 GP ကျန်ချိန်\n━━━━━━━━━━━━━━━━━━";
     for (let i = 0; i < gpLinks.length; i++) {
       const link     = gpLinks[i];
-      const accName  = accNames[i % accNames.length];
-      const lastSent = await getLastSent(accName, link);
-      const shortLink = link.length > 30 ? link.substring(0, 30) + "..." : link;
-
+      const lastSent = await getLastSent(acc.name, link);
+      const short    = link.length > 30 ? link.substring(0,30)+"..." : link;
       if (!lastSent) {
-        gpStatus += `\n${i + 1}. ✅ အသင့်ဖြစ်ပြီ [${accName}]\n   ${shortLink}`;
+        lines += `\n  ${i+1}. ✅ ${short}`;
       } else {
-        const diffMin   = Math.floor((Date.now() - new Date(lastSent).getTime()) / 60000);
-        const remaining = MIN_INTERVAL_MINUTES - diffMin;
-        if (remaining <= 0) {
-          gpStatus += `\n${i + 1}. ✅ အသင့်ဖြစ်ပြီ [${accName}]\n   ${shortLink}`;
-        } else {
-          gpStatus += `\n${i + 1}. ⏳ ${remaining} မိနစ်ကျန် [${accName}]\n   ${shortLink}`;
-        }
+        const diffMin   = (Date.now() - new Date(lastSent).getTime()) / 60000;
+        const remaining = Math.ceil(intervalMinutes - diffMin);
+        lines += remaining <= 0
+          ? `\n  ${i+1}. ✅ ${short}`
+          : `\n  ${i+1}. ⏳${remaining}မိနစ် ${short}`;
       }
     }
-  } else if (gpLinks.length === 0) {
-    gpStatus = "\n\n⚠️ GP link မထည့်ရသေး — /gp link1,link2,...";
-  } else {
-    gpStatus = "\n\n⚠️ Account မထည့်ရသေး — /addaccount acc1";
   }
 
-  ctx.reply(
-    `📊 လောလောဆယ် Status\n\n` +
-    `👤 Accounts: ${accounts.length} ခု (🟢 ${connected} connected)\n` +
-    `🔗 GP Links: ${gpLinks.length} ခု\n` +
-    `💬 Message: ${msgInfo}\n` +
-    `⏰ Scheduler: ${sched}\n` +
-    `🔒 Rate limit: ${MIN_INTERVAL_MINUTES} မိနစ်/တစ်ကြိမ်\n` +
-    `⏱ Delay: 3~8 sec random\n` +
-    `🔄 ပို့နေဆဲ: ${isSending ? "🔄 ဟုတ်" : "❌ မဟုတ်"}` +
-    gpStatus
-  );
+  ctx.reply(lines);
 });
 
-bot.command("ratelimit", adminOnly, async (ctx) => {
-  const gpLinks  = await getGPLinks();
-  const accounts = Object.keys(clientPool);
-  if (gpLinks.length === 0 || accounts.length === 0) {
-    return ctx.reply("📭 GP link သို့မဟုတ် account မရှိသေး။");
+
+// ─── JOIN GP ──────────────────────────────────────────────────────────────────
+// /joingp link1,link2,...           — account အကုန် join
+// /joingp accname link1,link2,...   — တစ်ကောင်တည်းသာ join
+
+let isJoining = false;
+
+bot.command("joingp", adminOnly, async (ctx) => {
+  if (isJoining) return ctx.reply("⚠️ Join လုပ်နေဆဲ ရှိသေးသည်။ ခဏစောင့်ပါ။");
+
+  const args = ctx.message.text.split(" ").slice(1).join(" ").trim();
+  if (!args) {
+    return ctx.reply(
+      "⚠️ Usage:\n\n" +
+      "/joingp link1,link2 — account အကုန် join\n" +
+      "/joingp acc1 link1,link2 — acc1 တစ်ကောင်တည်း join"
+    );
   }
 
-  let lines = [];
-  for (let i = 0; i < gpLinks.length; i++) {
-    const link    = gpLinks[i];
-    const accName = accounts[i % accounts.length];
-    const lastSent = await getLastSent(accName, link);
-    if (!lastSent) {
-      lines.push(`${i + 1}. [${accName}] ✅ မပို့ရသေး`);
-    } else {
-      const diffMin   = Math.floor((Date.now() - new Date(lastSent).getTime()) / 60000);
-      const remaining = MIN_INTERVAL_MINUTES - diffMin;
-      if (remaining <= 0) {
-        lines.push(`${i + 1}. [${accName}] ✅ ပို့ပြီး ${diffMin} မိနစ် — အသင့်ဖြစ်ပြီ`);
-      } else {
-        lines.push(`${i + 1}. [${accName}] ⏳ ကျန်ချိန်: ${remaining} မိနစ်`);
+  const accounts = await getAccounts();
+  const allNames = accounts.map(a => a.name);
+  const parts    = args.split(" ");
+  let targetAccs = [];
+  let linksStr   = "";
+
+  if (allNames.includes(parts[0])) {
+    const accName = parts[0];
+    if (!clientPool[accName]) return ctx.reply(`❌ "${accName}" connected မဟုတ်သေး။`);
+    targetAccs = [accName];
+    linksStr   = parts.slice(1).join(" ").trim();
+  } else {
+    const activeAccs = accounts.filter(a => clientPool[a.name]);
+    if (activeAccs.length === 0) return ctx.reply("❌ Connected account မရှိသေး။");
+    targetAccs = activeAccs.map(a => a.name);
+    linksStr   = args;
+  }
+
+  const links = linksStr.split(",").map(l => l.trim()).filter(Boolean);
+  if (links.length === 0) return ctx.reply("⚠️ GP link ထည့်ပါ။");
+
+  isJoining = true;
+
+  await ctx.reply(
+    `🚀 Join စတင်မည်\n` +
+    `👤 Accounts: ${targetAccs.join(", ")}\n` +
+    `🔗 GP: ${links.length} ခု\n` +
+    `⏱ Delay: 3s (join တိုင်းကြား)`
+  );
+
+  for (const accName of targetAccs) {
+    const client = clientPool[accName];
+    let success = 0, fail = 0, already = 0;
+
+    await bot.telegram.sendMessage(ADMIN_ID, `\n▶️ [${accName}] Join စမည်...`);
+
+    for (let i = 0; i < links.length; i++) {
+      const link = links[i];
+      const num  = i + 1;
+
+      try {
+        const entity = await client.getEntity(link);
+        await client.invoke(new (require("telegram/tl").Api.channels.JoinChannel)({ channel: entity }));
+        success++;
+        await bot.telegram.sendMessage(ADMIN_ID, `✅ Join ${num} done — [${accName}]\n${link}`);
+      } catch (err) {
+        const emsg = err.message || "";
+        if (emsg.includes("USER_ALREADY_PARTICIPANT") || emsg.includes("already")) {
+          already++;
+          await bot.telegram.sendMessage(ADMIN_ID, `ℹ️ Join ${num} — [${accName}] Join ပြီးနေပြီ\n${link}`);
+        } else {
+          fail++;
+          await bot.telegram.sendMessage(ADMIN_ID, `❌ Fail ${num} — [${accName}]\n${link}\n⚠️ ${emsg}`);
+        }
       }
+
+      if (i < links.length - 1) await new Promise(r => setTimeout(r, 3000));
+    }
+
+    await bot.telegram.sendMessage(ADMIN_ID,
+      `📊 [${accName}] ပြီး — ✅${success} ❌${fail} ℹ️${already}(ပြီးနေပြီ)`
+    );
+
+    if (targetAccs.indexOf(accName) < targetAccs.length - 1) {
+      await new Promise(r => setTimeout(r, 3000));
     }
   }
-  ctx.reply(`📋 Rate Limit Status:\n\n${lines.join("\n")}`);
+
+  await bot.telegram.sendMessage(ADMIN_ID, "🏁 GP Join အကုန်ပြီးပါပြီ!");
+  isJoining = false;
 });
 
 // ─── KEEP ALIVE ───────────────────────────────────────────────────────────────
 const http = require("http");
 const PORT = process.env.PORT || 3000;
-
-http.createServer((req, res) => { res.writeHead(200); res.end("GP Bot OK"); })
-  .listen(PORT, () => console.log(`🌐 Health server: ${PORT}`));
-
+http.createServer((req, res) => { res.writeHead(200); res.end("OK"); })
+  .listen(PORT, () => console.log(`🌐 Port ${PORT}`));
 setInterval(() => {
   const url = process.env.RENDER_EXTERNAL_URL || `http://localhost:${PORT}`;
-  http.get(url, (r) => console.log(`💓 ping ${r.statusCode}`)).on("error", () => {});
+  http.get(url, r => console.log(`💓 ${r.statusCode}`)).on("error", () => {});
 }, 14 * 60 * 1000);
 
 // ─── MAIN ─────────────────────────────────────────────────────────────────────
 async function main() {
   await connectDB();
-
-  const settings = await getSettings();
-  if (settings.autoMessage)     autoMessage     = settings.autoMessage;
-  if (settings.intervalMinutes) intervalMinutes = settings.intervalMinutes;
+  const s = await getGlobalSettings();
+  if (s.globalMsg)        globalMsg        = s.globalMsg;
+  if (s.intervalMinutes)  intervalMinutes  = s.intervalMinutes;
+  if (s.sendDelaySeconds) sendDelaySeconds = s.sendDelaySeconds;
 
   await initAllClients();
-  if (intervalMinutes > 0) startScheduler();
+  if (schedulerTimer === null && intervalMinutes > 0) {
+    // don't auto-start scheduler on boot, wait for /time command
+  }
 
   await bot.launch();
   console.log("✅ Bot started!");
-
-  await bot.telegram.sendMessage(
-    ADMIN_ID,
-    "✅ GP Auto Sender Bot အသင့်ဖြစ်ပြီ!\n\n/start နိပ်ပါ။"
-  );
-
-  // persist msg on every update
-  bot.use(async (ctx, next) => {
-    await next();
-    if (autoMessage) await saveSettings({ autoMessage }).catch(() => {});
-  });
+  await bot.telegram.sendMessage(ADMIN_ID, "✅ GP Bot အသင့်ဖြစ်ပြီ!\n\n/start နိပ်ပါ။");
 
   process.once("SIGINT",  () => bot.stop("SIGINT"));
   process.once("SIGTERM", () => bot.stop("SIGTERM"));
