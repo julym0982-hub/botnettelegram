@@ -728,7 +728,12 @@ async function main() {
     // don't auto-start scheduler on boot, wait for /time command
   }
 
-  await bot.launch();
+  // Clear any existing webhook + drop pending updates before polling
+  await bot.telegram.deleteWebhook({ drop_pending_updates: true });
+
+  await bot.launch({
+    dropPendingUpdates: true,
+  });
   console.log("✅ Bot started!");
   await bot.telegram.sendMessage(ADMIN_ID, "✅ GP Bot အသင့်ဖြစ်ပြီ!\n\n/start နိပ်ပါ။");
 
