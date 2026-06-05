@@ -261,71 +261,162 @@ async function sendAllAccounts(force = false) {
 bot.start(adminOnly, async (ctx) => {
   const accounts = await getAccounts();
   const connected = accounts.filter(a => clientPool[a.name]).length;
-  const sched = schedulerTimer ? `🟢 ${intervalMinutes} မိနစ်တစ်ကြိမ်` : "🔴 ပိတ်";
+  const sched     = schedulerTimer ? `🟢 ${intervalMinutes} မိနစ်တစ်ကြိမ်` : "🔴 ပိတ်ထား";
+  const msgStatus = globalMsg ? `"${globalMsg.substring(0,30)}..."` : "⚠️ မသတ်မှတ်ရသေး";
 
-  ctx.reply(
+  // Message 1 — Status + Account + GP
+  await ctx.reply(
 `👋 GP Auto Sender Bot 🤖
 
-📊 အခြေအနေ:
-👤 Accounts: ${accounts.length} (🟢${connected} connected)
-💬 Global msg: ${globalMsg ? `"${globalMsg.substring(0,25)}..."` : "⚠️ မသတ်မှတ်ရသေး"}
-⏰ Scheduler: ${sched}
-⏱ Delay: ${sendDelaySeconds}s | 🔒 Interval: ${intervalMinutes} မိနစ်
+━━━━━━━━━━━━━━━━━━
+📊 လောလောဆယ် အခြေအနေ
+━━━━━━━━━━━━━━━━━━
+👤 Accounts  : ${accounts.length} ခု (🟢 ${connected} connected)
+💬 Global msg: ${msgStatus}
+⏰ Scheduler : ${sched}
+⏱ Send delay : ${sendDelaySeconds}s
+🔒 Rate limit: ${intervalMinutes} မိနစ်တစ်ကြိမ်
 
 ━━━━━━━━━━━━━━━━━━
-👤 ACCOUNT
+👤 ACCOUNT Commands
 ━━━━━━━━━━━━━━━━━━
-/accounts — စာရင်းကြည့်
-/addaccount acc1 — account ထည့် (session file ပို့ရမည်)
-/removeaccount acc1 — ဖျက်
-/accountstatus — connected status
+/accounts
+  → account စာရင်းနဲ့ နံပါတ်တွေကြည့်
+
+/addaccount မိဘ
+  → "မိဘ" နာမည်နဲ့ account ထည့်
+  → Bot က session .txt file တောင်းမည်
+  → file ပို့ရုံပဲ — auto connect ဖြစ်မည်
+
+/removeaccount မိဘ
+  → "မိဘ" account ဖျက်
+
+/accountstatus
+  → account တိုင်း connected/disconnected ကြည့်
 
 ━━━━━━━━━━━━━━━━━━
-🔗 GP (per account)
+🔗 GP Commands (နံပါတ်နဲ့သုံး)
 ━━━━━━━━━━━━━━━━━━
-/checkaccount1 — acc1 ရဲ့ GP, msg, ကျန်ချိန် ကြည့်
-/acc1gp link1,link2 — acc1 ရဲ့ GP သတ်မှတ်
-/acc1addgp link — acc1 ကို GP တစ်ခုထည့်
-/acc1removegp 2 — acc1 ရဲ့ နံပါတ် 2 GP ဖျက်
-/acc1cleargp — acc1 ရဲ့ GP အကုန်ဖျက်
+⚠️ /accounts နိပ်ပြီး account နံပါတ် သိပါ
+
+/check1
+  → account 1 ရဲ့ GP list, message, ကျန်ချိန် အကုန်ကြည့်
+
+/1gp https://t.me/+xxx,https://t.me/+yyy
+  → account 1 ရဲ့ GP link တွေ တစ်ခါတည်းသတ်မှတ်
+  → comma ခြားပြီး အများကြီးထည့်လို့ရ
+
+/1gp
+  → account 1 ရဲ့ GP list ကြည့်
+
+/1addgp https://t.me/+zzz
+  → account 1 ကို GP link တစ်ခုထပ်ထည့်
+
+/1removegp 2
+  → account 1 ရဲ့ GP နံပါတ် 2 ဖျက်
+
+/1cleargp
+  → account 1 ရဲ့ GP link အကုန်ဖျက်
+
+💡 Account 2 ဆိုရင် → /2gp, /check2, /2addgp ...
+💡 Account 3 ဆိုရင် → /3gp, /check3, /3addgp ...`
+  );
+
+  // Message 2 — Message + Settings + Send + Join + Steps
+  await ctx.reply(
+`━━━━━━━━━━━━━━━━━━
+💬 MESSAGE Commands
+━━━━━━━━━━━━━━━━━━
+/msg မင်္ဂလာပါ ညီကိုများ
+  → account အကုန်အတွက် global message သတ်မှတ်
+  → GP link မထည့်ရသေးတဲ့ account တွေပါ သုံးမည်
+
+/msg
+  → global message ကြည့်
+
+/1msg မင်္ဂလာပါ ညီကိုများ
+  → account 1 သီးသန့် message (global ထက် priority မြင့်)
+
+/1msg
+  → account 1 ရဲ့ message ကြည့်
+
+/1clearmsg
+  → account 1 custom msg ဖျက် (global ကိုပြန်သုံးမည်)
+
+💡 Spin syntax — ပို့တိုင်း message ပြောင်းမည်
+/msg မင်္ဂလာပါ{spin}ဟေး{spin}ဟယ်လို ညီကိုများ
+  GP1 → "မင်္ဂလာပါ ညီကိုများ"
+  GP2 → "ဟေး ညီကိုများ"
+  GP3 → "ဟယ်လို ညီကိုများ"
+  (spam filter မကျအောင်) ✅
 
 ━━━━━━━━━━━━━━━━━━
-💬 MESSAGE
+⚙️ SETTINGS Commands
 ━━━━━━━━━━━━━━━━━━
-/msg စာသား — global msg (account အကုန်သုံး)
-/acc1msg စာသား — acc1 သီးသန့် msg
-  💡 Spin: မင်္ဂလာပါ{spin}ဟေး{spin}ဟယ်လို ညည်...
+/setinterval 59min
+  → တစ်ကောင်က တစ်ခုကို ဘယ်နှ မိနစ်တစ်ကြိမ်ပို့မည် သတ်မှတ်
+  → ဥပမာ: /setinterval 2hr (သို့) /setinterval 30min
+
+/setdelay 6
+  → GP တစ်ခုပြီး နောက်တစ်ခုပို့ဖို့ ကြားချိန် (seconds)
+  → ဥပမာ: /setdelay 10
 
 ━━━━━━━━━━━━━━━━━━
-⚙️ SETTINGS
+🤝 GP JOIN Commands
 ━━━━━━━━━━━━━━━━━━
-/setinterval 59min — rate limit ပြောင်း (e.g. 2hr, 30min)
-/setdelay 6 — GP တိုင်းကြား delay seconds ပြောင်း
+/joingp https://t.me/+xxx,https://t.me/+yyy
+  → connected account အကုန်နဲ့ GP တွေ join
+  → join တိုင်းကြား 3s delay ပါမည်
+
+/joingp မိဘ https://t.me/+xxx,https://t.me/+yyy
+  → "မိဘ" account တစ်ကောင်တည်းသာ join
 
 ━━━━━━━━━━━━━━━━━━
-📤 SEND
+📤 SEND Commands
 ━━━━━━━━━━━━━━━━━━
-/send — rate limit စစ်ပြီးပို့
-/forcesend — rate limit မစစ်ဘဲ အကုန်ပို့
-/time 60min — scheduler ဖွင့်
-/time stop — scheduler ရပ်
-/status — လောလောဆယ် status အကုန်
+/send
+  → rate limit စစ်ပြီး ပို့ (ကြာနိုင်)
+  → 59 မိနစ်မပြည့်သေးရင် skip ဖြစ်မည်
+
+/forcesend
+  → rate limit မစစ်ဘဲ ချက်ချင်းအကုန်ပို့
+
+/time 60min
+  → 60 မိနစ်တစ်ကြိမ် 24hr ပတ်လုံး auto ပို့
+  → ဥပမာ: /time 2hr (သို့) /time 30min
+
+/time stop
+  → auto ပို့ ရပ်
+
+/status
+  → account တိုင်း GP တိုင်း ကျန်ချိန် အကုန်ကြည့်
 
 ━━━━━━━━━━━━━━━━━━
-🤝 GP JOIN
+📌 စတင်သုံးနည်း (အဆင့်)
 ━━━━━━━━━━━━━━━━━━
-/joingp link1,link2,... — account အကုန် join
-/joingp acc1 link1,link2 — acc1 တစ်ကောင်တည်း join
-  (join တိုင်းကြား 3s delay ပါမည်)
+1️⃣ /addaccount မိဘ
+   → Bot က file တောင်းမည် → session .txt ပို့
 
-━━━━━━━━━━━━━━━━━━
-📌 စတင်သုံးနည်း
-━━━━━━━━━━━━━━━━━━
-1️⃣ /addaccount acc1 → file ပို့
-2️⃣ /joingp link1,link2 → GP join
-3️⃣ /acc1gp link1,link2 → GP send list ထည့်
-4️⃣ /msg မင်္ဂလာပါ (သို့) /acc1msg ...
-5️⃣ /time 60min → scheduler ဖွင့်`
+2️⃣ /joingp link1,link2,...
+   → GP တွေကို account တွေနဲ့ join
+
+3️⃣ /1gp link1,link2,...
+   → account 1 ရဲ့ ပို့မည့် GP list ထည့်
+
+4️⃣ /msg မင်္ဂလာပါ{spin}ဟေး ညီကိုများ
+   → message သတ်မှတ် (spin ထည့်ရင် ပိုကောင်း)
+
+5️⃣ /setinterval 60min
+   → rate limit သတ်မှတ်
+
+6️⃣ /time 60min
+   → scheduler ဖွင့် — အလိုအလျောက် ပို့နေမည် ✅
+
+🛡 Spam Protection (auto ပါမည်)
+✅ Random delay: GP တိုင်းကြား ${sendDelaySeconds}s
+✅ Rate limit: တစ်ကောင်က တစ်ခုကို ${intervalMinutes} မိနစ်တစ်ကြိမ်
+✅ Message spin: ပို့တိုင်း message ပြောင်း
+✅ Sequential send: ACC1 ပြီးမှ ACC2`
   );
 });
 
@@ -403,16 +494,14 @@ bot.on("document", adminOnly, async (ctx) => {
 });
 
 // ─── DYNAMIC ACCOUNT COMMANDS ─────────────────────────────────────────────────
-// Handles: /check<name>, /acc<name>gp, /acc<name>addgp, /acc<name>removegp,
-//          /acc<name>cleargp, /acc<name>msg, /acc<name>clearmsg
+// Pattern: /1gp  /1addgp  /1removegp  /1cleargp  /1msg  /1clearmsg  /check1
+// Number = account index (1-based) in accounts list order
 
 bot.on("text", adminOnly, async (ctx) => {
   if (!ctx.message?.text) return;
-  const raw  = ctx.message.text.trim();
-  // strip bot username if present e.g. /cmd@BotName
-  const text = raw.replace(/@\w+/, "");
+  const raw  = ctx.message.text.trim().replace(/@\w+/, "");
+  const text = raw;
 
-  // skip known static commands so bot.command() can handle them
   const knownCmds = [
     "/start","/accounts","/addaccount","/removeaccount","/accountstatus",
     "/msg","/setinterval","/setdelay","/time","/send","/forcesend",
@@ -420,133 +509,152 @@ bot.on("text", adminOnly, async (ctx) => {
   ];
   const base = text.split(" ")[0].toLowerCase();
   if (knownCmds.includes(base)) {
-    console.log(`[text handler] skip known cmd: ${base}`);
+    console.log(`[cmd] skip: ${base}`);
     return;
   }
 
-  console.log(`[text handler] received: ${text}`);
+  console.log(`[cmd] received: ${text}`);
 
   const accounts = await getAccounts();
 
-  for (const acc of accounts) {
-    const n = acc.name; // e.g. "acc1"
-
-    // ── /check<name>  e.g. /checkacc1
-    if (text === `/check${n}`) {
-      console.log(`[text handler] matched /check${n}`);
-      const gpLinks  = await getAccGPs(n);
-      const accDoc   = await getAccount(n);
-      const msg      = await getAccMsg(n, globalMsg);
-      const st       = clientPool[n] ? "🟢 Connected" : "🔴 Disconnected";
-      let gpStatus   = gpLinks.length === 0
-        ? "\n📭 GP link မရှိသေး"
-        : `\n\n━━━━━━━━━━━━━━━━━━\n📋 GP List & ကျန်ချိန်\n━━━━━━━━━━━━━━━━━━`;
-
-      for (let i = 0; i < gpLinks.length; i++) {
-        const link     = gpLinks[i];
-        const lastSent = await getLastSent(n, link);
-        const short    = link.length > 35 ? link.substring(0,35)+"..." : link;
-        if (!lastSent) {
-          gpStatus += `\n${i+1}. ✅ ${short}`;
-        } else {
-          const diffMin   = (Date.now() - new Date(lastSent).getTime()) / 60000;
-          const remaining = Math.ceil(intervalMinutes - diffMin);
-          gpStatus += remaining <= 0
-            ? `\n${i+1}. ✅ ${short}`
-            : `\n${i+1}. ⏳ ${remaining}မိနစ်ကျန် ${short}`;
-        }
-      }
-      return ctx.reply(
-        `👤 [${n}] Status\n\n${st}\n` +
-        `🔗 GP: ${gpLinks.length} ခု\n` +
-        `💬 Msg: ${accDoc?.customMsg ? `"${accDoc.customMsg.substring(0,40)}" (custom)` : msg ? `"${msg.substring(0,40)}" (global)` : "⚠️ မသတ်မှတ်ရသေး"}` +
-        gpStatus +
-        `\n\n📝 Edit:\n/acc${n}gp link1,link2\n/acc${n}addgp link\n/acc${n}removegp 1\n/acc${n}msg စာသား`
-      );
-    }
-
-    // ── /acc<name>gp <links>  e.g. /accacc1gp link1,link2
-    if (text.startsWith(`/acc${n}gp `)) {
-      console.log(`[text handler] matched /acc${n}gp set`);
-      const args  = text.slice(`/acc${n}gp `.length).trim();
-      const links = args.split(",").map(l => l.trim()).filter(Boolean);
-      if (!links.length) return ctx.reply("⚠️ link ထည့်ပါ");
-      await saveAccGPs(n, links);
-      return ctx.reply(`✅ [${n}] GP ${links.length} ခု:\n\n${links.map((l,i)=>`${i+1}. ${l}`).join("\n")}`);
-    }
-
-    // ── /acc<name>gp alone — view
-    if (text === `/acc${n}gp`) {
-      console.log(`[text handler] matched /acc${n}gp view`);
-      const links = await getAccGPs(n);
-      if (!links.length) return ctx.reply(`📭 [${n}] GP မရှိသေး\n/acc${n}gp link1,link2`);
-      return ctx.reply(`📋 [${n}] GP (${links.length}):\n\n${links.map((l,i)=>`${i+1}. ${l}`).join("\n")}`);
-    }
-
-    // ── /acc<name>addgp <link>
-    if (text.startsWith(`/acc${n}addgp `)) {
-      console.log(`[text handler] matched /acc${n}addgp`);
-      const link  = text.slice(`/acc${n}addgp `.length).trim();
-      if (!link) return ctx.reply("⚠️ link ထည့်ပါ");
-      const links = await getAccGPs(n);
-      links.push(link);
-      await saveAccGPs(n, links);
-      return ctx.reply(`✅ [${n}] GP ထည့်ပြီး:\n${link}\n\nစုစုပေါင်း: ${links.length}`);
-    }
-
-    // ── /acc<name>removegp <num>
-    if (text.startsWith(`/acc${n}removegp `)) {
-      console.log(`[text handler] matched /acc${n}removegp`);
-      const num   = parseInt(text.split(" ")[1]);
-      const links = await getAccGPs(n);
-      const idx   = num - 1;
-      if (isNaN(idx) || idx < 0 || idx >= links.length)
-        return ctx.reply(`⚠️ 1 မှ ${links.length} ထိ နံပါတ်ထည့်ပါ`);
-      const removed = links.splice(idx, 1)[0];
-      await saveAccGPs(n, links);
-      return ctx.reply(`🗑️ [${n}] ဖျက်ပြီး:\n${removed}\n\nကျန်: ${links.length}`);
-    }
-
-    // ── /acc<name>cleargp
-    if (text === `/acc${n}cleargp`) {
-      console.log(`[text handler] matched /acc${n}cleargp`);
-      await saveAccGPs(n, []);
-      return ctx.reply(`🗑️ [${n}] GP အကုန်ဖျက်ပြီး`);
-    }
-
-    // ── /acc<name>msg <text>
-    if (text.startsWith(`/acc${n}msg `)) {
-      console.log(`[text handler] matched /acc${n}msg set`);
-      const msg   = text.slice(`/acc${n}msg `.length).trim();
-      await saveAccount(n, { customMsg: msg });
-      const parts = msg.split("{spin}");
-      return ctx.reply(
-        `✅ [${n}] Custom message:\n\n"${msg}"` +
-        (parts.length > 1 ? `\n\n💡 Spin ${parts.length} မျိုး` : "")
-      );
-    }
-
-    // ── /acc<name>msg alone — view
-    if (text === `/acc${n}msg`) {
-      console.log(`[text handler] matched /acc${n}msg view`);
-      const accDoc = await getAccount(n);
-      return ctx.reply(
-        accDoc?.customMsg
-          ? `💬 [${n}] Custom msg:\n\n"${accDoc.customMsg}"\n\nဖျက်ရန်: /acc${n}clearmsg`
-          : `💬 [${n}] Custom msg မသတ်မှတ်ရသေး (global သုံးနေသည်)\n\nသတ်မှတ်ရန်: /acc${n}msg စာသား`
-      );
-    }
-
-    // ── /acc<name>clearmsg
-    if (text === `/acc${n}clearmsg`) {
-      console.log(`[text handler] matched /acc${n}clearmsg`);
-      await saveAccount(n, { customMsg: "" });
-      return ctx.reply(`🗑️ [${n}] Custom msg ဖျက်ပြီး (global msg ကိုပြန်သုံးမည်)`);
-    }
+  // helper: get account by 1-based index number
+  function getAccByNum(numStr) {
+    const idx = parseInt(numStr) - 1;
+    if (isNaN(idx) || idx < 0 || idx >= accounts.length) return null;
+    return accounts[idx];
   }
 
-  // no match — log it
-  console.log(`[text handler] no match for: ${text}`);
+  // ── /check<N>  e.g. /check1  /check2
+  const checkM = text.match(/^\/check(\d+)$/);
+  if (checkM) {
+    const acc = getAccByNum(checkM[1]);
+    if (!acc) return ctx.reply(`❌ Account ${checkM[1]} မတွေ့ပါ။\nရှိသည့် account: ${accounts.length} ခု`);
+    const n        = acc.name;
+    const gpLinks  = await getAccGPs(n);
+    const accDoc   = await getAccount(n);
+    const msg      = await getAccMsg(n, globalMsg);
+    const st       = clientPool[n] ? "🟢 Connected" : "🔴 Disconnected";
+    let gpStatus   = gpLinks.length === 0
+      ? "\n📭 GP link မရှိသေး"
+      : "\n\n━━━━━━━━━━━━━━━━━━\n📋 GP List & ကျန်ချိန်\n━━━━━━━━━━━━━━━━━━";
+    for (let i = 0; i < gpLinks.length; i++) {
+      const link     = gpLinks[i];
+      const lastSent = await getLastSent(n, link);
+      const short    = link.length > 35 ? link.substring(0,35)+"..." : link;
+      if (!lastSent) {
+        gpStatus += `\n${i+1}. ✅ ${short}`;
+      } else {
+        const diffMin   = (Date.now() - new Date(lastSent).getTime()) / 60000;
+        const remaining = Math.ceil(intervalMinutes - diffMin);
+        gpStatus += remaining <= 0
+          ? `\n${i+1}. ✅ ${short}`
+          : `\n${i+1}. ⏳ ${remaining}မိနစ်ကျန် ${short}`;
+      }
+    }
+    const num = checkM[1];
+    return ctx.reply(
+      `👤 [${n}] (#${num}) Status\n\n${st}\n` +
+      `🔗 GP: ${gpLinks.length} ခု\n` +
+      `💬 Msg: ${accDoc?.customMsg ? `"${accDoc.customMsg.substring(0,40)}" (custom)` : msg ? `"${msg.substring(0,40)}" (global)` : "⚠️ မသတ်မှတ်ရသေး"}` +
+      gpStatus +
+      `\n\n📝 Edit:\n/${num}gp link1,link2\n/${num}addgp link\n/${num}removegp 1\n/${num}msg စာသား`
+    );
+  }
+
+  // ── /<N>gp <links>  set GP list
+  const gpSetM = text.match(/^\/(\d+)gp (.+)$/);
+  if (gpSetM) {
+    const acc = getAccByNum(gpSetM[1]);
+    if (!acc) return ctx.reply(`❌ Account ${gpSetM[1]} မတွေ့ပါ။`);
+    const links = gpSetM[2].split(",").map(l => l.trim()).filter(Boolean);
+    if (!links.length) return ctx.reply("⚠️ link ထည့်ပါ");
+    await saveAccGPs(acc.name, links);
+    return ctx.reply(`✅ [${acc.name}] GP ${links.length} ခု:\n\n${links.map((l,i)=>`${i+1}. ${l}`).join("\n")}`);
+  }
+
+  // ── /<N>gp  view GP list
+  const gpViewM = text.match(/^\/(\d+)gp$/);
+  if (gpViewM) {
+    const acc = getAccByNum(gpViewM[1]);
+    if (!acc) return ctx.reply(`❌ Account ${gpViewM[1]} မတွေ့ပါ။`);
+    const links = await getAccGPs(acc.name);
+    if (!links.length) return ctx.reply(`📭 [${acc.name}] GP မရှိသေး\n/${gpViewM[1]}gp link1,link2`);
+    return ctx.reply(`📋 [${acc.name}] GP (${links.length}):\n\n${links.map((l,i)=>`${i+1}. ${l}`).join("\n")}`);
+  }
+
+  // ── /<N>addgp <link>
+  const addGpM = text.match(/^\/(\d+)addgp (.+)$/);
+  if (addGpM) {
+    const acc = getAccByNum(addGpM[1]);
+    if (!acc) return ctx.reply(`❌ Account ${addGpM[1]} မတွေ့ပါ။`);
+    const link  = addGpM[2].trim();
+    const links = await getAccGPs(acc.name);
+    links.push(link);
+    await saveAccGPs(acc.name, links);
+    return ctx.reply(`✅ [${acc.name}] GP ထည့်ပြီး:\n${link}\n\nစုစုပေါင်း: ${links.length}`);
+  }
+
+  // ── /<N>removegp <num>
+  const rmGpM = text.match(/^\/(\d+)removegp (\d+)$/);
+  if (rmGpM) {
+    const acc   = getAccByNum(rmGpM[1]);
+    if (!acc) return ctx.reply(`❌ Account ${rmGpM[1]} မတွေ့ပါ။`);
+    const links = await getAccGPs(acc.name);
+    const idx   = parseInt(rmGpM[2]) - 1;
+    if (idx < 0 || idx >= links.length)
+      return ctx.reply(`⚠️ 1 မှ ${links.length} ထိ နံပါတ်ထည့်ပါ`);
+    const removed = links.splice(idx, 1)[0];
+    await saveAccGPs(acc.name, links);
+    return ctx.reply(`🗑️ [${acc.name}] ဖျက်ပြီး:\n${removed}\n\nကျန်: ${links.length}`);
+  }
+
+  // ── /<N>cleargp
+  const clrGpM = text.match(/^\/(\d+)cleargp$/);
+  if (clrGpM) {
+    const acc = getAccByNum(clrGpM[1]);
+    if (!acc) return ctx.reply(`❌ Account ${clrGpM[1]} မတွေ့ပါ။`);
+    await saveAccGPs(acc.name, []);
+    return ctx.reply(`🗑️ [${acc.name}] GP အကုန်ဖျက်ပြီး`);
+  }
+
+  // ── /<N>msg <text>  set custom msg
+  const msgSetM = text.match(/^\/(\d+)msg (.+)$/);
+  if (msgSetM) {
+    const acc = getAccByNum(msgSetM[1]);
+    if (!acc) return ctx.reply(`❌ Account ${msgSetM[1]} မတွေ့ပါ။`);
+    const msg = msgSetM[2].trim();
+    await saveAccount(acc.name, { customMsg: msg });
+    const parts = msg.split("{spin}");
+    return ctx.reply(
+      `✅ [${acc.name}] Custom message:\n\n"${msg}"` +
+      (parts.length > 1 ? `\n\n💡 Spin ${parts.length} မျိုး` : "")
+    );
+  }
+
+  // ── /<N>msg  view custom msg
+  const msgViewM = text.match(/^\/(\d+)msg$/);
+  if (msgViewM) {
+    const acc    = getAccByNum(msgViewM[1]);
+    if (!acc) return ctx.reply(`❌ Account ${msgViewM[1]} မတွေ့ပါ။`);
+    const accDoc = await getAccount(acc.name);
+    const num    = msgViewM[1];
+    return ctx.reply(
+      accDoc?.customMsg
+        ? `💬 [${acc.name}] Custom msg:\n\n"${accDoc.customMsg}"\n\nဖျက်ရန်: /${num}clearmsg`
+        : `💬 [${acc.name}] Custom msg မသတ်မှတ်ရသေး (global သုံးနေသည်)\n\nသတ်မှတ်ရန်: /${num}msg စာသား`
+    );
+  }
+
+  // ── /<N>clearmsg
+  const clrMsgM = text.match(/^\/(\d+)clearmsg$/);
+  if (clrMsgM) {
+    const acc = getAccByNum(clrMsgM[1]);
+    if (!acc) return ctx.reply(`❌ Account ${clrMsgM[1]} မတွေ့ပါ။`);
+    await saveAccount(acc.name, { customMsg: "" });
+    return ctx.reply(`🗑️ [${acc.name}] Custom msg ဖျက်ပြီး`);
+  }
+
+  console.log(`[cmd] no match: ${text}`);
 });
 
 // ─── GLOBAL MSG ───────────────────────────────────────────────────────────────
