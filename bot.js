@@ -1,6 +1,7 @@
 const { Telegraf } = require("telegraf");
 const { TelegramClient } = require("telegram");
 const { StringSession } = require("telegram/sessions");
+const { ConnectionTCPMTProxyAbridged } = require("telegram/network/connection/TCPMTProxy");
 const { MongoClient } = require("mongodb");
 require("dotenv").config();
 
@@ -97,9 +98,32 @@ function pickSpun(template) {
 
 async function buildClient(sessionString) {
   const client = new TelegramClient(
-    new StringSession(sessionString), API_ID, API_HASH, { connectionRetries: 5 }
+    new StringSession(sessionString), API_ID, API_HASH,
+    {
+      connectionRetries: 10,
+      retryDelay: 2000,
+      autoReconnect: true,
+      useWSS: false,
+      timeout: 30,
+      requestRetries: 5,
+      floodSleepThreshold: 60,
+    }
   );
   await client.connect();
+
+  // Keep alive ping every 60s to prevent TIMEOUT disconnect
+  const keepAliveInterval = setInterval(async () => {
+    try {
+      if (client.connected) {
+        await client.getMe();
+      }
+    } catch (e) {
+      console.log(`[keepalive] reconnecting...`);
+      try { await client.connect(); } catch (_) {}
+    }
+  }, 60 * 1000);
+
+  client._keepAliveInterval = keepAliveInterval;
   return client;
 }
 
@@ -329,7 +353,13 @@ bot.command("removeaccount", adminOnly, async (ctx) => {
   const name = ctx.message.text.split(" ").slice(1).join(" ").trim();
   if (!name) return ctx.reply("⚠️ Usage: /removeaccount acc1");
   if (!(await getAccount(name))) return ctx.reply(`❌ "${name}" မတွေ့ပါ။`);
-  if (clientPool[name]) { try { await clientPool[name].disconnect(); } catch(_){} delete clientPool[name]; }
+  if (clientPool[name]) {
+    try {
+      if (clientPool[name]._keepAliveInterval) clearInterval(clientPool[name]._keepAliveInterval);
+      await clientPool[name].disconnect();
+    } catch(_){}
+    delete clientPool[name];
+  }
   await deleteAccount(name);
   ctx.reply(`🗑️ "${name}" ဖျက်ပြီးပါပြီ။`);
 });
@@ -738,13 +768,29 @@ async function main() {
     // don't auto-start scheduler on boot, wait for /time command
   }
 
-  // Clear any existing webhook + drop pending updates before polling
+  // Clear webhook and kill any existing polling sessions
   await bot.telegram.deleteWebhook({ drop_pending_updates: true });
 
-  await bot.launch({
-    dropPendingUpdates: true,
-  });
-  console.log("✅ Bot started!");
+  // retry loop — if 409 conflict, wait 5s and retry
+  let launched = false;
+  let retryCount = 0;
+  while (!launched) {
+    try {
+      await bot.launch({ dropPendingUpdates: true });
+      launched = true;
+      console.log("✅ Bot started!");
+    } catch (err) {
+      if (err.response?.error_code === 409) {
+        retryCount++;
+        console.log(`⚠️ 409 Conflict — retry ${retryCount} in 5s...`);
+        await new Promise(r => setTimeout(r, 5000));
+        // force clear again
+        await bot.telegram.deleteWebhook({ drop_pending_updates: true }).catch(() => {});
+      } else {
+        throw err;
+      }
+    }
+  }
   await bot.telegram.sendMessage(ADMIN_ID, "✅ GP Bot အသင့်ဖြစ်ပြီ!\n\n/start နိပ်ပါ။");
 
   process.once("SIGINT",  () => bot.stop("SIGINT"));
